@@ -1,21 +1,25 @@
 [package]
-name = "ddgr"
+name = "websearch-rs"
 version = "0.1.0"
 edition = "2021"
-description = "DuckDuckGo search from the terminal, in Rust"
+description = "Search the web from the terminal — DuckDuckGo, Mojeek, ArXiv with automatic fallback"
 license = "GPL-3.0"
+repository = "https://github.com/eliosai/websearch-rs"
+keywords = ["search", "cli", "duckduckgo", "arxiv", "web"]
+categories = ["command-line-utilities"]
 
 [lib]
-name = "ddgr"
+name = "websearch"
 path = "src/lib.rs"
 
 [[bin]]
-name = "ddgr"
+name = "websearch"
 path = "src/bin/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", features = ["blocking", "gzip"] }
+roxmltree = "0.20"
 scraper = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

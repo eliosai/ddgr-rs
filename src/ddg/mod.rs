@@ -46,6 +46,7 @@ pub fn search_page(
         vqd: page.vqd,
         user_agent: opts.user_agent.clone(),
         result_count: page.results.len(),
+        total_results: 0,
     };
 
     Ok((page.results, pag))
@@ -115,6 +116,7 @@ pub fn search_next_page(
         },
         user_agent: pag.user_agent.clone(),
         result_count: page.results.len(),
+        total_results: 0,
     };
 
     Ok((page.results, new_pag))

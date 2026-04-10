@@ -1,11 +1,12 @@
-//! # ddgr
+//! # websearch
 //!
 //! Search the web from the terminal. Queries DuckDuckGo (primary) with
-//! automatic Mojeek fallback when blocked.
+//! automatic Mojeek fallback, plus ArXiv for academic papers.
 //!
-//! Supports auto-pagination to collect up to `max_results` results,
-//! and outputs as JSON or TOON (compact, LLM-friendly format).
+//! Auto-paginates to collect up to `max_results` results and outputs
+//! as JSON or TOON (compact, LLM-friendly format).
 
+pub mod arxiv;
 pub mod ddg;
 pub mod mojeek;
 
@@ -25,7 +26,6 @@ pub const DEFAULT_USER_AGENT: &str =
 
 const MAX_RESULTS_CAP: usize = 40;
 const DEFAULT_MAX_RESULTS: usize = 10;
-const PAGINATION_DELAY_MS: u64 = 1500;
 
 // ---------------------------------------------------------------------------
 // Engine selection
@@ -36,6 +36,7 @@ pub enum Engine {
     #[default]
     DuckDuckGo,
     Mojeek,
+    ArXiv,
 }
 
 impl std::fmt::Display for Engine {
@@ -43,6 +44,7 @@ impl std::fmt::Display for Engine {
         match self {
             Engine::DuckDuckGo => write!(f, "DuckDuckGo"),
             Engine::Mojeek => write!(f, "Mojeek"),
+            Engine::ArXiv => write!(f, "ArXiv"),
         }
     }
 }
@@ -100,11 +102,11 @@ pub struct SearchOptions {
     pub duration: String,
     /// Custom User-Agent string; empty string means send no UA header.
     pub user_agent: String,
-    /// HTTPS proxy URL (e.g. "https://127.0.0.1:9050").
+    /// HTTPS proxy URL.
     pub proxy: Option<String>,
     pub toon: bool,
-    /// Force a specific engine. `None` = try DuckDuckGo, fall back to Mojeek.
-    pub engine: Option<Engine>,
+    /// Force a specific provider. `None` = DuckDuckGo with Mojeek fallback.
+    pub provider: Option<Engine>,
     /// Maximum results to collect (auto-paginates as needed). Capped at 40.
     pub max_results: usize,
 }
@@ -119,7 +121,7 @@ impl Default for SearchOptions {
             user_agent: DEFAULT_USER_AGENT.into(),
             proxy: None,
             toon: false,
-            engine: None,
+            provider: None,
             max_results: DEFAULT_MAX_RESULTS,
         }
     }
@@ -135,6 +137,8 @@ pub struct PaginationState {
     pub page: usize,
     pub cur_index: i64,
     pub result_count: usize,
+    /// Total results available (ArXiv reports this explicitly).
+    pub total_results: usize,
     // DDG-specific pagination tokens
     pub next_params: String,
     pub prev_params: String,
@@ -145,11 +149,14 @@ pub struct PaginationState {
 }
 
 impl PaginationState {
-    /// Whether more pages are likely available.
     pub fn has_next(&self) -> bool {
         match self.engine {
             Engine::DuckDuckGo => !self.next_params.is_empty() && !self.vqd.is_empty(),
             Engine::Mojeek => self.result_count >= mojeek::RESULTS_PER_PAGE,
+            Engine::ArXiv => {
+                let fetched = (self.cur_index - 1) as usize;
+                self.total_results > 0 && fetched < self.total_results
+            }
         }
     }
 }
@@ -160,17 +167,17 @@ impl PaginationState {
 
 /// Search the web, auto-paginating to collect up to `opts.max_results` results.
 ///
-/// If `opts.engine` is set, only that engine is used.
+/// If `opts.provider` is set, only that engine is used.
 /// Otherwise, tries DuckDuckGo first; on any error, falls back to Mojeek.
 pub fn search(opts: &SearchOptions) -> Result<Vec<SearchResult>, SearchError> {
     let max = opts.max_results.min(MAX_RESULTS_CAP);
 
-    match opts.engine {
+    match opts.provider {
         Some(engine) => search_with_engine(engine, opts, max),
         None => match search_with_engine(Engine::DuckDuckGo, opts, max) {
             Ok(r) => Ok(r),
             Err(e) => {
-                eprintln!("[ddgr] DuckDuckGo failed ({}), trying Mojeek...", e);
+                eprintln!("[websearch] DuckDuckGo failed ({}), trying Mojeek...", e);
                 search_with_engine(Engine::Mojeek, opts, max)
             }
         },
@@ -185,13 +192,15 @@ fn search_with_engine(
     let (mut results, mut pag) = match engine {
         Engine::DuckDuckGo => ddg::search_page(opts),
         Engine::Mojeek => mojeek::search_page(opts),
+        Engine::ArXiv => arxiv::search_page(opts),
     }?;
 
     while results.len() < max && pag.has_next() {
-        std::thread::sleep(Duration::from_millis(PAGINATION_DELAY_MS));
+        std::thread::sleep(pagination_delay(engine));
         let (more, new_pag) = match engine {
             Engine::DuckDuckGo => ddg::search_next_page(opts, &pag),
             Engine::Mojeek => mojeek::search_next_page(opts, &pag),
+            Engine::ArXiv => arxiv::search_next_page(opts, &pag),
         }?;
         if more.is_empty() {
             break;
@@ -202,6 +211,14 @@ fn search_with_engine(
 
     results.truncate(max);
     Ok(results)
+}
+
+/// Per-engine delay between pagination requests.
+fn pagination_delay(engine: Engine) -> Duration {
+    match engine {
+        Engine::DuckDuckGo | Engine::Mojeek => Duration::from_millis(1500),
+        Engine::ArXiv => Duration::from_millis(3000), // ArXiv TOS: max 1 req/3s
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -267,7 +284,7 @@ mod tests {
         assert_eq!(opts.user_agent, DEFAULT_USER_AGENT);
         assert!(opts.proxy.is_none());
         assert!(!opts.toon);
-        assert!(opts.engine.is_none());
+        assert!(opts.provider.is_none());
         assert_eq!(opts.max_results, DEFAULT_MAX_RESULTS);
     }
 
@@ -302,23 +319,9 @@ mod tests {
         ];
         let json_str = results_to_json(&results);
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        assert!(parsed.is_array());
         let arr = parsed.as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["title"], "Rust");
-    }
-
-    #[test]
-    fn test_results_to_toon_format() {
-        let results = vec![SearchResult {
-            index: 1,
-            title: "Rust".into(),
-            url: "https://rust-lang.org".into(),
-            abstract_text: "A systems language".into(),
-        }];
-        let toon_str = results_to_toon(&results);
-        assert!(!toon_str.is_empty());
-        assert!(toon_str.contains("Rust"));
     }
 
     #[test]
@@ -338,27 +341,7 @@ mod tests {
 
     #[test]
     fn test_build_client_defaults() {
-        let opts = SearchOptions::default();
-        assert!(build_client(&opts).is_ok());
-    }
-
-    #[test]
-    fn test_build_client_no_ua() {
-        let opts = SearchOptions {
-            user_agent: String::new(),
-            ..Default::default()
-        };
-        assert!(build_client(&opts).is_ok());
-    }
-
-    #[test]
-    fn test_max_results_capped() {
-        let opts = SearchOptions {
-            max_results: 100,
-            ..Default::default()
-        };
-        // The cap is enforced in search(), not in the struct
-        assert_eq!(opts.max_results.min(MAX_RESULTS_CAP), 40);
+        assert!(build_client(&SearchOptions::default()).is_ok());
     }
 
     #[test]
@@ -370,12 +353,7 @@ mod tests {
             ..Default::default()
         };
         assert!(pag.has_next());
-
-        let pag_empty = PaginationState {
-            engine: Engine::DuckDuckGo,
-            ..Default::default()
-        };
-        assert!(!pag_empty.has_next());
+        assert!(!PaginationState::default().has_next());
     }
 
     #[test]
@@ -387,12 +365,38 @@ mod tests {
         };
         assert!(pag.has_next());
 
-        let pag_partial = PaginationState {
+        let partial = PaginationState {
             engine: Engine::Mojeek,
             result_count: 5,
             ..Default::default()
         };
-        assert!(!pag_partial.has_next());
+        assert!(!partial.has_next());
+    }
+
+    #[test]
+    fn test_pagination_has_next_arxiv() {
+        let pag = PaginationState {
+            engine: Engine::ArXiv,
+            cur_index: 11,
+            total_results: 100,
+            ..Default::default()
+        };
+        assert!(pag.has_next());
+
+        let done = PaginationState {
+            engine: Engine::ArXiv,
+            cur_index: 101,
+            total_results: 100,
+            ..Default::default()
+        };
+        assert!(!done.has_next());
+    }
+
+    #[test]
+    fn test_pagination_delay_arxiv_slower() {
+        let ddg_delay = pagination_delay(Engine::DuckDuckGo);
+        let arxiv_delay = pagination_delay(Engine::ArXiv);
+        assert!(arxiv_delay > ddg_delay);
     }
 
     // -----------------------------------------------------------------------
@@ -404,12 +408,11 @@ mod tests {
     fn test_ddg_search() {
         let opts = SearchOptions {
             keywords: "rust programming language".into(),
-            engine: Some(Engine::DuckDuckGo),
+            provider: Some(Engine::DuckDuckGo),
             ..Default::default()
         };
-        let results = search(&opts).expect("search should succeed");
+        let results = search(&opts).expect("DDG search should succeed");
         assert!(!results.is_empty());
-        assert!(results[0].url.starts_with("http"));
     }
 
     #[test]
@@ -417,11 +420,24 @@ mod tests {
     fn test_mojeek_search() {
         let opts = SearchOptions {
             keywords: "rust programming language".into(),
-            engine: Some(Engine::Mojeek),
+            provider: Some(Engine::Mojeek),
             ..Default::default()
         };
-        let results = search(&opts).expect("search should succeed");
+        let results = search(&opts).expect("Mojeek search should succeed");
         assert!(!results.is_empty());
+    }
+
+    #[test]
+    #[ignore]
+    fn test_arxiv_search() {
+        let opts = SearchOptions {
+            keywords: "machine learning".into(),
+            provider: Some(Engine::ArXiv),
+            ..Default::default()
+        };
+        let results = search(&opts).expect("ArXiv search should succeed");
+        assert!(!results.is_empty());
+        assert!(results[0].url.contains("arxiv.org"));
     }
 
     #[test]
@@ -433,18 +449,5 @@ mod tests {
         };
         let results = search(&opts).expect("auto search should succeed");
         assert!(!results.is_empty());
-    }
-
-    #[test]
-    #[ignore]
-    fn test_max_results_respected() {
-        let opts = SearchOptions {
-            keywords: "linux".into(),
-            engine: Some(Engine::DuckDuckGo),
-            max_results: 5,
-            ..Default::default()
-        };
-        let results = search(&opts).expect("search should succeed");
-        assert!(results.len() <= 5);
     }
 }

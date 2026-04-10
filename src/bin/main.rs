@@ -1,13 +1,15 @@
 use clap::Parser;
-use ddgr::{results_to_json, results_to_toon, search, Engine, SearchOptions, DEFAULT_USER_AGENT};
 use std::process;
+use websearch::{
+    results_to_json, results_to_toon, search, Engine, SearchOptions, DEFAULT_USER_AGENT,
+};
 
 /// Search the web from the terminal.
 ///
-/// Queries DuckDuckGo's lite endpoint (default) with automatic Mojeek fallback.
+/// Providers: DuckDuckGo (default + Mojeek fallback), Mojeek, ArXiv.
 /// Outputs results as JSON (default) or TOON for compact, LLM-friendly output.
 #[derive(Parser, Debug)]
-#[command(name = "ddgr", version, about)]
+#[command(name = "websearch", version, about)]
 struct Cli {
     /// Search keywords
     #[arg(required = true)]
@@ -16,6 +18,10 @@ struct Cli {
     /// Number of results to return (max 40)
     #[arg(short = 'n', long, default_value = "10")]
     num: usize,
+
+    /// Search provider: ddg, mojeek, arxiv (default: ddg with mojeek fallback)
+    #[arg(short = 'p', long)]
+    provider: Option<String>,
 
     /// Region code (e.g. "us-en", "wt-wt" for no region)
     #[arg(short = 'r', long, default_value = "wt-wt")]
@@ -34,16 +40,12 @@ struct Cli {
     noua: bool,
 
     /// HTTPS proxy URL
-    #[arg(short = 'p', long)]
+    #[arg(long)]
     proxy: Option<String>,
 
     /// Output results in TOON format instead of JSON
     #[arg(long)]
     toon: bool,
-
-    /// Force a specific engine: ddg, mojeek (default: auto with fallback)
-    #[arg(short = 'e', long)]
-    engine: Option<String>,
 }
 
 fn main() {
@@ -55,11 +57,12 @@ fn main() {
         process::exit(1);
     }
 
-    let engine = match cli.engine.as_deref() {
+    let provider = match cli.provider.as_deref() {
         Some("ddg") | Some("duckduckgo") => Some(Engine::DuckDuckGo),
         Some("mojeek") => Some(Engine::Mojeek),
+        Some("arxiv") => Some(Engine::ArXiv),
         Some(other) => {
-            eprintln!("Unknown engine '{}'. Available: ddg, mojeek", other);
+            eprintln!("Unknown provider '{}'. Available: ddg, mojeek, arxiv", other);
             process::exit(1);
         }
         None => None,
@@ -77,7 +80,7 @@ fn main() {
         },
         proxy: cli.proxy,
         toon: cli.toon,
-        engine,
+        provider,
         max_results: cli.num,
     };
 
