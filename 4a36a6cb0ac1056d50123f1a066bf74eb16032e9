@@ -1,0 +1,35 @@
+src/bin/main.rs
+  4a30abcfe7b59ff3 2,5,7-8,16-19,43-46,58-66,76,80-81,85
+Cargo.toml
+  4a30abcfe7b59ff3 18-19
+src/lib.rs
+  4a30abcfe7b59ff3 3-4,6-7,9-10,22,26-48,55,59,106-109,122-123,134,137-138,142-144,147-154,158,161,163-176,180-181,183-200,203-204,207-209,232,235,270-271,336,342,351,355,357,360-361,365-369,372-378,382-385,388-395,399,404,407,410-412,417,419-420,423-424,429,431,434-435,440,442-444,447-448
+src/mojeek/parser.rs
+  4a30abcfe7b59ff3 1-140
+src/mojeek/mod.rs
+  4a30abcfe7b59ff3 1-78
+src/ddg/mod.rs
+  4a30abcfe7b59ff3 1-121
+src/ddg/parser.rs
+  4a30abcfe7b59ff3 1-256
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "4a36a6cb0ac1056d50123f1a066bf74eb16032e9",
+  "prompts": {
+    "4a30abcfe7b59ff3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1ddc670f-f788-460d-9c0e-e5215a5b9e3f",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "jsmey7",
+      "messages": [],
+      "total_additions": 1012,
+      "total_deletions": 950,
+      "accepted_lines": 801,
+      "overriden_lines": 0
+    }
+  }
+}
