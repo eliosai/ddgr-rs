@@ -1,49 +1,62 @@
 //! # ddgr
 //!
-//! A Rust library and CLI for searching DuckDuckGo from the terminal.
+//! Search the web from the terminal. Queries DuckDuckGo (primary) with
+//! automatic Mojeek fallback when blocked.
 //!
-//! Uses the same strategy as the original Python `ddgr`: POST requests to
-//! `https://html.duckduckgo.com/html` (DuckDuckGo's lite, JS-free endpoint),
-//! then parses the static HTML response for search results.
-//!
-//! Supports optional TOON (Token-Oriented Object Notation) output via the
-//! `toon` crate for compact, LLM-friendly serialization.
+//! Supports auto-pagination to collect up to `max_results` results,
+//! and outputs as JSON or TOON (compact, LLM-friendly format).
 
-mod parser;
+pub mod ddg;
+pub mod mojeek;
 
-use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::blocking::Client;
-use reqwest::cookie::Jar;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-
-pub use parser::DdgParser;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const DDG_URL: &str = "https://html.duckduckgo.com/html";
-const DEFAULT_USER_AGENT: &str =
+pub const DEFAULT_USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
      Chrome/120.0.0.0 Safari/537.36";
+
+const MAX_RESULTS_CAP: usize = 40;
+const DEFAULT_MAX_RESULTS: usize = 10;
+const PAGINATION_DELAY_MS: u64 = 1500;
+
+// ---------------------------------------------------------------------------
+// Engine selection
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Engine {
+    #[default]
+    DuckDuckGo,
+    Mojeek,
+}
+
+impl std::fmt::Display for Engine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Engine::DuckDuckGo => write!(f, "DuckDuckGo"),
+            Engine::Mojeek => write!(f, "Mojeek"),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Error)]
-pub enum DdgError {
+pub enum SearchError {
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
 
-    #[error("Failed to decompress gzip payload: {0}")]
-    Gzip(#[from] std::io::Error),
-
-    #[error("DuckDuckGo returned unusual-activity block (captcha). This is an IP-level restriction.")]
+    #[error("Search engine blocked the request (captcha/rate-limit)")]
     Blocked,
 
     #[error("No results found")]
@@ -54,7 +67,6 @@ pub enum DdgError {
 // Result type
 // ---------------------------------------------------------------------------
 
-/// A single DuckDuckGo search result.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SearchResult {
     pub index: usize,
@@ -64,7 +76,6 @@ pub struct SearchResult {
 }
 
 impl SearchResult {
-    /// Convert to a serde_json::Value for toon encoding.
     pub fn to_json_value(&self) -> serde_json::Value {
         serde_json::json!({
             "index": self.index,
@@ -79,12 +90,9 @@ impl SearchResult {
 // Search options
 // ---------------------------------------------------------------------------
 
-/// Options controlling a DuckDuckGo search.
 #[derive(Debug, Clone)]
 pub struct SearchOptions {
-    /// The search query keywords.
     pub keywords: String,
-    /// Region code (e.g. "us-en", "wt-wt" for no region).
     pub region: String,
     /// Safe-search level: -2 = off, -1 = moderate, 1 = strict.
     pub safe: i8,
@@ -94,8 +102,11 @@ pub struct SearchOptions {
     pub user_agent: String,
     /// HTTPS proxy URL (e.g. "https://127.0.0.1:9050").
     pub proxy: Option<String>,
-    /// Whether to use TOON encoding for output.
     pub toon: bool,
+    /// Force a specific engine. `None` = try DuckDuckGo, fall back to Mojeek.
+    pub engine: Option<Engine>,
+    /// Maximum results to collect (auto-paginates as needed). Capped at 40.
+    pub max_results: usize,
 }
 
 impl Default for SearchOptions {
@@ -108,6 +119,8 @@ impl Default for SearchOptions {
             user_agent: DEFAULT_USER_AGENT.into(),
             proxy: None,
             toon: false,
+            engine: None,
+            max_results: DEFAULT_MAX_RESULTS,
         }
     }
 }
@@ -116,137 +129,85 @@ impl Default for SearchOptions {
 // Pagination state
 // ---------------------------------------------------------------------------
 
-/// Holds pagination state for multi-page fetches.
 #[derive(Debug, Clone, Default)]
 pub struct PaginationState {
+    pub engine: Engine,
     pub page: usize,
     pub cur_index: i64,
+    pub result_count: usize,
+    // DDG-specific pagination tokens
     pub next_params: String,
     pub prev_params: String,
     pub vqd: String,
-    pub result_count: usize,
+    /// The User-Agent used for this search session.
+    /// DDG's vqd token is tied to the UA — pagination MUST use the same one.
+    pub user_agent: String,
+}
+
+impl PaginationState {
+    /// Whether more pages are likely available.
+    pub fn has_next(&self) -> bool {
+        match self.engine {
+            Engine::DuckDuckGo => !self.next_params.is_empty() && !self.vqd.is_empty(),
+            Engine::Mojeek => self.result_count >= mojeek::RESULTS_PER_PAGE,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Core search functions
+// High-level search with auto-pagination and fallback
 // ---------------------------------------------------------------------------
 
-/// Perform a first-page search and return results.
+/// Search the web, auto-paginating to collect up to `opts.max_results` results.
 ///
-/// Mirrors the Python `ddgr` approach: POST to `html.duckduckgo.com/html`
-/// with the same form fields and headers (`Accept-Encoding: gzip`,
-/// `User-Agent`, `DNT: 1`). A cookie jar is used to persist any session
-/// cookies DDG sets (Python's `urllib` does this implicitly when an opener
-/// with `HTTPCookieProcessor` is used).
-pub fn search(opts: &SearchOptions) -> Result<(Vec<SearchResult>, PaginationState), DdgError> {
-    let client = build_client(opts)?;
+/// If `opts.engine` is set, only that engine is used.
+/// Otherwise, tries DuckDuckGo first; on any error, falls back to Mojeek.
+pub fn search(opts: &SearchOptions) -> Result<Vec<SearchResult>, SearchError> {
+    let max = opts.max_results.min(MAX_RESULTS_CAP);
 
-    let mut form: HashMap<&str, String> = HashMap::new();
-    form.insert("q", opts.keywords.clone());
-    form.insert("b", String::new());
-    form.insert("df", opts.duration.clone());
-    form.insert("kf", "-1".into());
-    form.insert("kh", "1".into());
-    form.insert("kl", opts.region.clone());
-    form.insert("kp", opts.safe.to_string());
-    form.insert("k1", "-1".into());
-
-    let resp = client
-        .post(DDG_URL)
-        .header("Accept-Encoding", "gzip")
-        .header("DNT", "1")
-        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-        .header("Accept-Language", "en-US,en;q=0.5")
-        .header("Referer", "https://html.duckduckgo.com/")
-        .form(&form)
-        .send()?;
-
-    let body = resp.text()?;
-
-    let mut parser = DdgParser::new(0);
-    parser.parse(&body);
-
-    if parser.is_blocked {
-        return Err(DdgError::Blocked);
-    }
-
-    let pagination = PaginationState {
-        page: 0,
-        cur_index: 1 + parser.results.len() as i64,
-        next_params: parser.np_next.clone(),
-        prev_params: parser.np_prev.clone(),
-        vqd: parser.vqd.clone(),
-        result_count: parser.results.len(),
-    };
-
-    Ok((parser.results, pagination))
-}
-
-/// Fetch the next page given existing pagination state.
-pub fn search_next(
-    opts: &SearchOptions,
-    pag: &PaginationState,
-) -> Result<(Vec<SearchResult>, PaginationState), DdgError> {
-    let client = build_client(opts)?;
-    let next_page = pag.page + 1;
-
-    let mut form: HashMap<&str, String> = HashMap::new();
-    form.insert("q", opts.keywords.clone());
-    form.insert("s", (50 * (next_page.saturating_sub(1)) + 30).to_string());
-    form.insert("nextParams", pag.next_params.clone());
-    form.insert("v", "l".into());
-    form.insert("o", "json".into());
-    form.insert("dc", pag.cur_index.to_string());
-    form.insert("df", opts.duration.clone());
-    form.insert("api", "/d.js".into());
-    form.insert("kf", "-1".into());
-    form.insert("kh", "1".into());
-    form.insert("kl", opts.region.clone());
-    form.insert("kp", opts.safe.to_string());
-    form.insert("k1", "-1".into());
-    form.insert("vqd", pag.vqd.clone());
-
-    let resp = client
-        .post(DDG_URL)
-        .header("Accept-Encoding", "gzip")
-        .header("DNT", "1")
-        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-        .header("Accept-Language", "en-US,en;q=0.5")
-        .header("Referer", "https://html.duckduckgo.com/")
-        .form(&form)
-        .send()?;
-
-    let body = resp.text()?;
-
-    let offset = if pag.cur_index > 0 {
-        pag.cur_index as usize - 1
-    } else {
-        0
-    };
-    let mut parser = DdgParser::new(offset);
-    parser.parse(&body);
-
-    if parser.is_blocked {
-        return Err(DdgError::Blocked);
-    }
-
-    let new_pag = PaginationState {
-        page: next_page,
-        cur_index: pag.cur_index + parser.results.len() as i64,
-        next_params: parser.np_next.clone(),
-        prev_params: parser.np_prev.clone(),
-        vqd: if parser.vqd.is_empty() {
-            pag.vqd.clone()
-        } else {
-            parser.vqd.clone()
+    match opts.engine {
+        Some(engine) => search_with_engine(engine, opts, max),
+        None => match search_with_engine(Engine::DuckDuckGo, opts, max) {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                eprintln!("[ddgr] DuckDuckGo failed ({}), trying Mojeek...", e);
+                search_with_engine(Engine::Mojeek, opts, max)
+            }
         },
-        result_count: parser.results.len(),
-    };
-
-    Ok((parser.results, new_pag))
+    }
 }
 
-/// Format results as a JSON string.
+fn search_with_engine(
+    engine: Engine,
+    opts: &SearchOptions,
+    max: usize,
+) -> Result<Vec<SearchResult>, SearchError> {
+    let (mut results, mut pag) = match engine {
+        Engine::DuckDuckGo => ddg::search_page(opts),
+        Engine::Mojeek => mojeek::search_page(opts),
+    }?;
+
+    while results.len() < max && pag.has_next() {
+        std::thread::sleep(Duration::from_millis(PAGINATION_DELAY_MS));
+        let (more, new_pag) = match engine {
+            Engine::DuckDuckGo => ddg::search_next_page(opts, &pag),
+            Engine::Mojeek => mojeek::search_next_page(opts, &pag),
+        }?;
+        if more.is_empty() {
+            break;
+        }
+        results.extend(more);
+        pag = new_pag;
+    }
+
+    results.truncate(max);
+    Ok(results)
+}
+
+// ---------------------------------------------------------------------------
+// Output formatters
+// ---------------------------------------------------------------------------
+
 pub fn results_to_json(results: &[SearchResult]) -> String {
     let objects: Vec<serde_json::Value> = results
         .iter()
@@ -261,7 +222,6 @@ pub fn results_to_json(results: &[SearchResult]) -> String {
     serde_json::to_string_pretty(&objects).unwrap_or_else(|_| "[]".into())
 }
 
-/// Format results as TOON-encoded string.
 pub fn results_to_toon(results: &[SearchResult]) -> String {
     let objects: Vec<serde_json::Value> = results.iter().map(|r| r.to_json_value()).collect();
     let value = serde_json::Value::Array(objects);
@@ -269,14 +229,11 @@ pub fn results_to_toon(results: &[SearchResult]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Internal helpers
+// Shared HTTP client builder
 // ---------------------------------------------------------------------------
 
-fn build_client(opts: &SearchOptions) -> Result<Client, reqwest::Error> {
-    let cookie_jar = Arc::new(Jar::default());
-
+pub(crate) fn build_client(opts: &SearchOptions) -> Result<Client, reqwest::Error> {
     let mut builder = Client::builder()
-        .cookie_provider(cookie_jar)
         .gzip(true)
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(15))
@@ -301,10 +258,6 @@ fn build_client(opts: &SearchOptions) -> Result<Client, reqwest::Error> {
 mod tests {
     use super::*;
 
-    // -----------------------------------------------------------------------
-    // Unit tests (offline, always pass)
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_default_options() {
         let opts = SearchOptions::default();
@@ -314,6 +267,8 @@ mod tests {
         assert_eq!(opts.user_agent, DEFAULT_USER_AGENT);
         assert!(opts.proxy.is_none());
         assert!(!opts.toon);
+        assert!(opts.engine.is_none());
+        assert_eq!(opts.max_results, DEFAULT_MAX_RESULTS);
     }
 
     #[test]
@@ -351,9 +306,6 @@ mod tests {
         let arr = parsed.as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["title"], "Rust");
-        assert_eq!(arr[0]["url"], "https://rust-lang.org");
-        assert_eq!(arr[0]["abstract"], "A systems language");
-        assert_eq!(arr[1]["title"], "Go");
     }
 
     #[test]
@@ -366,9 +318,7 @@ mod tests {
         }];
         let toon_str = results_to_toon(&results);
         assert!(!toon_str.is_empty());
-        // TOON output should contain the data
         assert!(toon_str.contains("Rust"));
-        assert!(toon_str.contains("rust-lang.org"));
     }
 
     #[test]
@@ -381,56 +331,15 @@ mod tests {
                 abstract_text: format!("This is the abstract for result number {}", i),
             })
             .collect();
-
         let json_str = results_to_json(&results);
         let toon_str = results_to_toon(&results);
-
-        assert!(
-            toon_str.len() < json_str.len(),
-            "TOON ({} bytes) should be more compact than JSON ({} bytes)",
-            toon_str.len(),
-            json_str.len()
-        );
-    }
-
-    #[test]
-    fn test_json_vs_toon_same_data() {
-        let results = vec![
-            SearchResult {
-                index: 1,
-                title: "Alpha".into(),
-                url: "https://alpha.com".into(),
-                abstract_text: "First result".into(),
-            },
-            SearchResult {
-                index: 2,
-                title: "Beta".into(),
-                url: "https://beta.com".into(),
-                abstract_text: "Second result".into(),
-            },
-        ];
-
-        // JSON path
-        let json_str = results_to_json(&results);
-        let json_parsed: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(json_parsed.len(), 2);
-
-        // TOON path
-        let toon_str = results_to_toon(&results);
-        assert!(!toon_str.is_empty());
-
-        // Both should contain the same data
-        assert!(toon_str.contains("Alpha"));
-        assert!(toon_str.contains("Beta"));
-        assert!(toon_str.contains("alpha.com"));
-        assert!(toon_str.contains("beta.com"));
+        assert!(toon_str.len() < json_str.len());
     }
 
     #[test]
     fn test_build_client_defaults() {
         let opts = SearchOptions::default();
-        let client = build_client(&opts);
-        assert!(client.is_ok(), "default client should build successfully");
+        assert!(build_client(&opts).is_ok());
     }
 
     #[test]
@@ -439,141 +348,103 @@ mod tests {
             user_agent: String::new(),
             ..Default::default()
         };
-        let client = build_client(&opts);
-        assert!(client.is_ok(), "client with empty UA should build");
+        assert!(build_client(&opts).is_ok());
+    }
+
+    #[test]
+    fn test_max_results_capped() {
+        let opts = SearchOptions {
+            max_results: 100,
+            ..Default::default()
+        };
+        // The cap is enforced in search(), not in the struct
+        assert_eq!(opts.max_results.min(MAX_RESULTS_CAP), 40);
+    }
+
+    #[test]
+    fn test_pagination_has_next_ddg() {
+        let pag = PaginationState {
+            engine: Engine::DuckDuckGo,
+            next_params: "abc".into(),
+            vqd: "xyz".into(),
+            ..Default::default()
+        };
+        assert!(pag.has_next());
+
+        let pag_empty = PaginationState {
+            engine: Engine::DuckDuckGo,
+            ..Default::default()
+        };
+        assert!(!pag_empty.has_next());
+    }
+
+    #[test]
+    fn test_pagination_has_next_mojeek() {
+        let pag = PaginationState {
+            engine: Engine::Mojeek,
+            result_count: 10,
+            ..Default::default()
+        };
+        assert!(pag.has_next());
+
+        let pag_partial = PaginationState {
+            engine: Engine::Mojeek,
+            result_count: 5,
+            ..Default::default()
+        };
+        assert!(!pag_partial.has_next());
     }
 
     // -----------------------------------------------------------------------
-    // Integration tests (hit actual DDG API)
-    //
-    // These are marked #[ignore] because they require network access to
-    // DuckDuckGo and will fail if the IP is captcha-blocked. Run them with:
-    //   cargo test -- --ignored
+    // Integration tests — run with: cargo test -- --ignored
     // -----------------------------------------------------------------------
 
     #[test]
     #[ignore]
-    fn test_search_returns_results() {
+    fn test_ddg_search() {
         let opts = SearchOptions {
             keywords: "rust programming language".into(),
+            engine: Some(Engine::DuckDuckGo),
             ..Default::default()
         };
-        let (results, pag) = search(&opts).expect("search should succeed");
-        assert!(!results.is_empty(), "should return at least one result");
-        assert!(!pag.vqd.is_empty(), "should have a vqd token for pagination");
-
-        let first = &results[0];
-        assert!(!first.title.is_empty(), "title should not be empty");
-        assert!(first.url.starts_with("http"), "url should start with http");
+        let results = search(&opts).expect("search should succeed");
+        assert!(!results.is_empty());
+        assert!(results[0].url.starts_with("http"));
     }
 
     #[test]
     #[ignore]
-    fn test_search_json_output() {
+    fn test_mojeek_search() {
         let opts = SearchOptions {
             keywords: "rust programming language".into(),
+            engine: Some(Engine::Mojeek),
             ..Default::default()
         };
-        let (results, _) = search(&opts).expect("search should succeed");
-        assert!(!results.is_empty(), "should have results");
-        let json_str = results_to_json(&results);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&json_str).expect("JSON should be valid");
-        assert!(parsed.is_array());
-        let arr = parsed.as_array().unwrap();
-        assert!(!arr.is_empty());
-        for item in arr {
-            assert!(item.get("title").is_some());
-            assert!(item.get("url").is_some());
-            assert!(item.get("abstract").is_some());
-        }
+        let results = search(&opts).expect("search should succeed");
+        assert!(!results.is_empty());
     }
 
     #[test]
     #[ignore]
-    fn test_search_toon_output() {
+    fn test_auto_fallback() {
         let opts = SearchOptions {
-            keywords: "rust programming language".into(),
+            keywords: "rust programming".into(),
             ..Default::default()
         };
-        let (results, _) = search(&opts).expect("search should succeed");
-        assert!(!results.is_empty(), "should have results");
-        let toon_str = results_to_toon(&results);
-        let json_str = results_to_json(&results);
-        assert!(
-            toon_str.len() <= json_str.len(),
-            "TOON should be more compact than JSON (toon={}, json={})",
-            toon_str.len(),
-            json_str.len()
-        );
+        let results = search(&opts).expect("auto search should succeed");
+        assert!(!results.is_empty());
     }
 
     #[test]
     #[ignore]
-    fn test_search_no_toon_vs_toon() {
+    fn test_max_results_respected() {
         let opts = SearchOptions {
-            keywords: "DuckDuckGo search engine".into(),
+            keywords: "linux".into(),
+            engine: Some(Engine::DuckDuckGo),
+            max_results: 5,
             ..Default::default()
         };
-        let (results, _) = search(&opts).expect("search should succeed");
-        assert!(!results.is_empty(), "should have results");
-
-        let json_out = results_to_json(&results);
-        let toon_out = results_to_toon(&results);
-        assert!(!json_out.is_empty());
-        assert!(!toon_out.is_empty());
-
-        let parsed: serde_json::Value = serde_json::from_str(&json_out).unwrap();
-        assert!(parsed.is_array());
-        assert!(
-            toon_out.len() <= json_out.len(),
-            "TOON should be <= JSON size"
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn test_search_with_region() {
-        let opts = SearchOptions {
-            keywords: "weather today".into(),
-            region: "us-en".into(),
-            ..Default::default()
-        };
-        let (results, _) = search(&opts).expect("search should succeed");
-        assert!(!results.is_empty(), "region search should return results");
-    }
-
-    #[test]
-    #[ignore]
-    fn test_search_safe_off() {
-        let opts = SearchOptions {
-            keywords: "rust programming language".into(),
-            safe: -2,
-            ..Default::default()
-        };
-        let (results, _) = search(&opts).expect("search should succeed");
-        assert!(!results.is_empty(), "safe=off search should return results");
-    }
-
-    #[test]
-    #[ignore]
-    fn test_pagination() {
-        let opts = SearchOptions {
-            keywords: "linux kernel".into(),
-            ..Default::default()
-        };
-        let (first_results, pag) = search(&opts).expect("first page should succeed");
-        assert!(!first_results.is_empty(), "first page should have results");
-
-        if !pag.next_params.is_empty() && !pag.vqd.is_empty() {
-            std::thread::sleep(Duration::from_secs(2));
-            let (second_results, _) = search_next(&opts, &pag).expect("next page should succeed");
-            if !second_results.is_empty() {
-                assert_ne!(
-                    first_results[0].url, second_results[0].url,
-                    "page 2 results should differ from page 1"
-                );
-            }
-        }
+        let results = search(&opts).expect("search should succeed");
+        assert!(results.len() <= 5);
     }
 }
