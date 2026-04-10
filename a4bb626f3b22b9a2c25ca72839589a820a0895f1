@@ -1,0 +1,33 @@
+src/bin/main.rs
+  4a30abcfe7b59ff3 3-5,9,12,22-25,43,60,63,65,83
+src/ddg/mod.rs
+  4a30abcfe7b59ff3 49,119
+src/arxiv/parser.rs
+  4a30abcfe7b59ff3 1-177
+Cargo.toml
+  4a30abcfe7b59ff3 2,5,7-9,12,16,22
+src/arxiv/mod.rs
+  4a30abcfe7b59ff3 1-88
+src/lib.rs
+  4a30abcfe7b59ff3 1,4,6-7,9,39,47,105,108-109,124,140-141,156-159,170,175,180,195,199,203,216-221,287,344,356,368,373-389,392-399,411,414,423,426,432,434-435,438,440,445,447,450-451
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "a4bb626f3b22b9a2c25ca72839589a820a0895f1",
+  "prompts": {
+    "4a30abcfe7b59ff3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1ddc670f-f788-460d-9c0e-e5215a5b9e3f",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "jsmey7",
+      "messages": [],
+      "total_additions": 364,
+      "total_deletions": 87,
+      "accepted_lines": 364,
+      "overriden_lines": 0
+    }
+  }
+}
